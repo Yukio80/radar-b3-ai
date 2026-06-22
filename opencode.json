@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "radar-b3",
+  "agent": {
+    "radar-b3": {
+      "description": "Agente especialista em análise da bolsa brasileira (B3). Pesquisa oportunidades, calcula indicadores fundamentalistas e técnicos, e gera rankings de ações.",
+      "mode": "primary"
+    }
+  },
+  "skills": {
+    "paths": [".opencode/skills"]
+  }
+}

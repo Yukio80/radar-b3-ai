@@ -1,0 +1,7 @@
+yfinance>=1.4
+fundamentus>=0.3
+streamlit>=1.28
+plotly>=5.18
+pandas>=2.0
+numpy>=1.24
+requests>=2.28
