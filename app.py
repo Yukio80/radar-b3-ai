@@ -28,6 +28,9 @@ comando_etfs = _analise.comando_etfs
 comando_bdrs = _analise.comando_bdrs
 comando_carteiras = _analise.comando_carteiras
 
+from database import listar_snapshots, carregar_snapshot, historico_portfolio, init_db
+init_db()
+
 st.set_page_config(
     page_title="Radar B3 AI",
     page_icon="📈",
@@ -166,6 +169,7 @@ PAGES = {
     "💵 Dividendos": "dividendos",
     "🧙 Magic Formula": "magic",
     "💼 Carteiras": "carteiras",
+    "📈 Histórico": "historico",
 }
 
 st.sidebar.title("📊 Radar B3 AI")
@@ -726,6 +730,91 @@ elif page_key == "carteiras":
                 },
             )
             st.plotly_chart(fig, use_container_width=True)
+
+
+elif page_key == "historico":
+    st.title("📈 Histórico de Análises")
+    st.markdown("Snapshots salvos automaticamente a cada execução")
+
+    tab1, tab2 = st.tabs(["📸 Snapshots", "💼 Evolução das Carteiras"])
+
+    with tab1:
+        tipos = ["radar", "fiis", "etfs", "bdrs", "dividendos", "magic_formula", "carteiras"]
+        tipo_filter = st.selectbox("Filtrar por tipo", ["todos"] + tipos)
+        filtro = None if tipo_filter == "todos" else tipo_filter
+
+        snapshots = listar_snapshots(filtro, limite=50)
+        if not snapshots:
+            st.info("Nenhum snapshot encontrado. Execute alguma análise primeiro.")
+        else:
+            st.caption(f"{len(snapshots)} snapshots encontrados")
+            for snap in snapshots:
+                label = f"{snap['data_hora']} — {snap['tipo']}"
+                if st.button(label, key=f"snap_{snap['id']}", use_container_width=True):
+                    dados = carregar_snapshot(snap["id"])
+                    if dados:
+                        st.session_state["snapshot_view"] = dados
+                        st.session_state["snapshot_tipo"] = snap["tipo"]
+                        st.session_state["snapshot_data"] = snap["data_hora"]
+
+            if "snapshot_view" in st.session_state:
+                st.divider()
+                st.subheader(f"{st.session_state['snapshot_tipo']} — {st.session_state['snapshot_data']}")
+                dados = st.session_state["snapshot_view"]
+                st.json(dados)
+
+    with tab2:
+        perfis_opt = ["conservador", "moderado", "arrojado", "aposentadoria"]
+        perfil_sel = st.selectbox("Perfil", perfis_opt,
+                                  format_func=lambda x: {"conservador": "🛡️ Conservador",
+                                                          "moderado": "⚖️ Moderado",
+                                                          "arrojado": "🚀 Arrojado",
+                                                          "aposentadoria": "🏖️ Aposentadoria"}[x])
+
+        hist = historico_portfolio(perfil_sel, limite=30)
+        if not hist:
+            st.info("Nenhum histórico para este perfil. Execute 'Carteiras' primeiro.")
+        else:
+            hist = list(reversed(hist))
+
+            st.subheader("📊 Evolução do Score")
+            df_hist = pd.DataFrame(hist)
+            fig_score = px.line(
+                df_hist, x="data_hora", y="score_medio",
+                title=f"Score Médio - {perfil_sel}",
+                markers=True,
+                labels={"data_hora": "Data", "score_medio": "Score"},
+            )
+            fig_score.update_layout(yaxis_range=[0, 100])
+            st.plotly_chart(fig_score, use_container_width=True)
+
+            st.subheader("💵 Evolução do DY Ponderado")
+            fig_dy = px.line(
+                df_hist, x="data_hora", y="dy_ponderado",
+                title=f"DY Ponderado - {perfil_sel}",
+                markers=True,
+                labels={"data_hora": "Data", "dy_ponderado": "DY %"},
+            )
+            st.plotly_chart(fig_dy, use_container_width=True)
+
+            st.subheader("📋 Últimos Registros")
+            for item in reversed(hist[-10:]):
+                with st.expander(f"{item['data_hora']} — Score: {item['score_medio']}  DY: {item['dy_ponderado']}%  Ativos: {item['total_ativos']}"):
+                    aloc = item.get("alocacao", {})
+                    if aloc:
+                        st.caption("Alocação: " + " · ".join(f"{k} {v}%" for k, v in aloc.items()))
+                    ativos = item.get("ativos", [])
+                    if ativos:
+                        df_at = pd.DataFrame(ativos)
+                        df_at["Preço"] = df_at["preco"].apply(lambda x: format_brl(x) if x else "-")
+                        df_at["Peso"] = df_at["peso"].apply(lambda x: f"{x}%")
+                        show = ["ticker", "tipo", "Preço", "Peso", "score", "dy"]
+                        st.dataframe(
+                            df_at[[c for c in show if c in df_at.columns]]
+                            .rename(columns={"ticker": "Ticker", "tipo": "Tipo", "Preço": "Preço",
+                                             "Peso": "Peso", "score": "Score", "dy": "DY %"}),
+                            use_container_width=True, hide_index=True,
+                        )
 
 
 elif page_key == "dividendos":

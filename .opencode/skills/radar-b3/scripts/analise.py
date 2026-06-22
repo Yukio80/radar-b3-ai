@@ -1,10 +1,14 @@
 import sys
 import json
 import time
+import os
 import requests
 import pandas as pd
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), *[".."] * 4))
+from database import salvar_snapshot, salvar_portfolio
 
 BRAPI_BASE = "https://brapi.dev/api"
 USER_AGENT = "RadarB3/1.0"
@@ -486,12 +490,14 @@ def comando_radar():
     df = pd.DataFrame(resultados)
     df = df.sort_values("score_total", ascending=False)
     top = df.head(20).to_dict(orient="records")
-    print(json.dumps({
+    saida = {
         "tipo": "radar",
         "data": time.strftime("%Y-%m-%d %H:%M"),
         "total_analisados": len(resultados),
         "top_oportunidades": top,
-    }, indent=2, ensure_ascii=False))
+    }
+    salvar_snapshot("radar", saida)
+    print(json.dumps(saida, indent=2, ensure_ascii=False))
 
 def comando_analisar(ticker):
     ticker = ticker.upper().strip()
@@ -543,11 +549,13 @@ def comando_dividendos():
     df = pd.DataFrame(resultados)
     df = df.sort_values("dy", ascending=False)
     top = df.head(20).to_dict(orient="records")
-    print(json.dumps({
+    saida = {
         "tipo": "top_dividendos",
         "data": time.strftime("%Y-%m-%d %H:%M"),
         "top": top,
-    }, indent=2, ensure_ascii=False))
+    }
+    salvar_snapshot("dividendos", saida)
+    print(json.dumps(saida, indent=2, ensure_ascii=False))
 
 def comando_magic_formula():
     print("🔄 Executando Magic Formula para B3...", file=sys.stderr)
@@ -582,11 +590,13 @@ def comando_magic_formula():
     df["magic_score"] = df[["rank_pl", "rank_ev_ebit"]].sum(axis=1).rank()
     df = df.sort_values("magic_score")
     top = df.head(20).to_dict(orient="records")
-    print(json.dumps({
+    saida = {
         "tipo": "magic_formula",
         "data": time.strftime("%Y-%m-%d %H:%M"),
         "top": top,
-    }, indent=2, ensure_ascii=False))
+    }
+    salvar_snapshot("magic_formula", saida)
+    print(json.dumps(saida, indent=2, ensure_ascii=False))
 
 def comando_fiis():
     print("🏢 Buscando FIIs...", file=sys.stderr)
@@ -607,12 +617,14 @@ def comando_fiis():
     df = pd.DataFrame(resultados)
     df = df.sort_values("score_total", ascending=False)
     top = df.head(20).to_dict(orient="records")
-    print(json.dumps({
+    saida = {
         "tipo": "fiis",
         "data": time.strftime("%Y-%m-%d %H:%M"),
         "total_analisados": len(resultados),
         "top_fiis": top,
-    }, indent=2, ensure_ascii=False))
+    }
+    salvar_snapshot("fiis", saida)
+    print(json.dumps(saida, indent=2, ensure_ascii=False))
 
 def comando_analisar_fii(ticker):
     ticker = ticker.upper().strip()
@@ -660,12 +672,14 @@ def comando_etfs():
     df = pd.DataFrame(resultados)
     df = df.sort_values("score_total", ascending=False)
     top = df.head(20).to_dict(orient="records")
-    print(json.dumps({
+    saida = {
         "tipo": "etfs",
         "data": time.strftime("%Y-%m-%d %H:%M"),
         "total_analisados": len(resultados),
         "top_etfs": top,
-    }, indent=2, ensure_ascii=False))
+    }
+    salvar_snapshot("etfs", saida)
+    print(json.dumps(saida, indent=2, ensure_ascii=False))
 
 def comando_bdrs():
     print("🌎 Buscando BDRs...", file=sys.stderr)
@@ -686,12 +700,14 @@ def comando_bdrs():
     df = pd.DataFrame(resultados)
     df = df.sort_values("score_total", ascending=False)
     top = df.head(20).to_dict(orient="records")
-    print(json.dumps({
+    saida = {
         "tipo": "bdrs",
         "data": time.strftime("%Y-%m-%d %H:%M"),
         "total_analisados": len(resultados),
         "top_bdrs": top,
-    }, indent=2, ensure_ascii=False))
+    }
+    salvar_snapshot("bdrs", saida)
+    print(json.dumps(saida, indent=2, ensure_ascii=False))
 
 PERFIS_CARTEIRAS = {
     "conservador": {
@@ -840,11 +856,18 @@ def comando_carteiras():
             "ativos": carteira_ativos,
         }
 
-    print(json.dumps({
+    saida = {
         "tipo": "carteiras",
         "data": time.strftime("%Y-%m-%d %H:%M"),
         "perfis": carteiras,
-    }, indent=2, ensure_ascii=False))
+    }
+    salvar_snapshot("carteiras", saida)
+    for chave, p in carteiras.items():
+        salvar_portfolio(
+            chave, p["score_medio"], p["dy_ponderado"],
+            p["total_ativos"], p["ativos"], p["alocacao"],
+        )
+    print(json.dumps(saida, indent=2, ensure_ascii=False))
 
 def main():
     args = sys.argv[1:]
