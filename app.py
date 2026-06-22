@@ -27,6 +27,7 @@ comando_fiis = _analise.comando_fiis
 comando_etfs = _analise.comando_etfs
 comando_bdrs = _analise.comando_bdrs
 comando_carteiras = _analise.comando_carteiras
+comando_qpe = _analise.comando_qpe
 
 from database import listar_snapshots, carregar_snapshot, historico_portfolio, init_db
 init_db()
@@ -159,6 +160,18 @@ def run_carteiras():
         st.error(f"Erro ao processar carteiras:\n{err.getvalue()}")
         return None
 
+def run_qpe():
+    buf = io.StringIO()
+    err = io.StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        comando_qpe()
+    out = buf.getvalue()
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        st.error(f"Erro ao executar QPE:\n{err.getvalue()}")
+        return None
+
 
 PAGES = {
     "📡 Radar": "radar",
@@ -169,6 +182,7 @@ PAGES = {
     "💵 Dividendos": "dividendos",
     "🧙 Magic Formula": "magic",
     "💼 Carteiras": "carteiras",
+    "🧠 QPE v2": "qpe",
     "📈 Histórico": "historico",
 }
 
@@ -730,6 +744,121 @@ elif page_key == "carteiras":
                 },
             )
             st.plotly_chart(fig, use_container_width=True)
+
+
+elif page_key == "qpe":
+    st.title("🧠 Quantitative Portfolio Engine v2")
+    st.markdown("Score multifatorial (Qualidade + Valuation + Dividendos + Crescimento + Segurança)")
+
+    if st.button("🚀 Executar QPE v2", type="primary", use_container_width=True):
+        with st.spinner("Pipeline quantitativa em execução (outliers → CAGR → score → pesos → IRP → stress test)..."):
+            data = run_qpe()
+        if data:
+            st.session_state["qpe_data"] = data
+
+    if "qpe_data" not in st.session_state:
+        with st.spinner("Primeira execução..."):
+            st.session_state["qpe_data"] = run_qpe()
+
+    data = st.session_state.get("qpe_data")
+    if not data:
+        st.warning("Clique em 'Executar QPE v2' para iniciar.")
+        st.stop()
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Data", data.get("data", "-"))
+    col2.metric("Ativos Analisados", data.get("total_analisados", 0))
+    col3.metric("Score Médio", f'{data.get("score_medio", 0)}/100')
+    irp = data.get("irp", {})
+    col4.metric("IRP", f'{irp.get("IRP", 0)}/100', irp.get("classificacao", ""))
+
+    if irp:
+        sub = irp.get("sub_scores", {})
+        if sub:
+            st.subheader("🛡️ Índice de Robustez Patrimonial")
+            sub_df = pd.DataFrame([{
+                "Componente": {"diversificacao": "Diversificação",
+                               "qualidade_media": "Qualidade Média",
+                               "estabilidade_dividendos": "Estabilidade Dividendos",
+                               "baixa_alavancagem": "Baixa Alavancagem"}.get(k, k),
+                "Score": v
+            } for k, v in sub.items()])
+            st.dataframe(sub_df, use_container_width=True, hide_index=True)
+
+    stress = data.get("stress_test", {})
+    if stress:
+        cenarios = stress.get("cenarios", {})
+        if cenarios:
+            st.subheader("⚠️ Stress Test")
+            stress_rows = []
+            for name, result in cenarios.items():
+                if isinstance(result, dict) and "perda_estimada" in result:
+                    stress_rows.append({
+                        "Cenário": name,
+                        "Perda Estimada": f'{result["perda_estimada"]:.1f}%',
+                        "Recuperação": f'{result.get("recuperacao_estimada_dias", 0)} dias',
+                    })
+            if stress_rows:
+                st.dataframe(pd.DataFrame(stress_rows), use_container_width=True, hide_index=True)
+
+    top10 = data.get("top_10", [])
+    if top10:
+        st.subheader("🏆 Top 10 Ativos (Score Multifatorial)")
+        top_df = pd.DataFrame(top10)
+        fatores = ["qualidade", "valuation", "dividendos", "crescimento", "seguranca"]
+        for f in fatores:
+            if f in top_df.columns:
+                top_df[f] = top_df[f].round(1)
+        top_df["classificacao"] = top_df.get("classificacao", "")
+        st.dataframe(top_df, use_container_width=True, hide_index=True)
+
+        fig = px.bar(
+            top_df, x="ticker", y="score",
+            color="classificacao",
+            title="Top 10 - Score Total",
+            color_discrete_map={
+                "Elite": "#00c853", "Excelente": "#64dd17",
+                "Boa": "#ff9100", "Média": "#ffd600", "Fraca": "#ff1744",
+            },
+            text_auto=".1f",
+        )
+        fig.update_layout(yaxis_range=[0, 100])
+        st.plotly_chart(fig, use_container_width=True)
+
+        exps = data.get("explicacoes", [])
+        if exps:
+            st.subheader("📋 Explicações por Ativo")
+            for exp_item in exps[:10]:
+                with st.expander(f"{exp_item['ticker']} — Score: {exp_item['score']}"):
+                    if exp_item.get("pontos_fortes"):
+                        st.markdown("**✅ Pontos Fortes:**")
+                        for p in exp_item["pontos_fortes"][:4]:
+                            st.markdown(f"- {p}")
+                    if exp_item.get("pontos_fracos"):
+                        st.markdown("**⚠️ Pontos Fracos:**")
+                        for p in exp_item["pontos_fracos"][:4]:
+                            st.markdown(f"- {p}")
+
+    outliers = data.get("outliers", {})
+    if outliers:
+        st.subheader("🔍 Outliers Detectados")
+        out_rows = []
+        for col, rep in outliers.items():
+            if rep.get("outliers", 0) > 0:
+                out_rows.append({
+                    "Métrica": col,
+                    "Total": rep["total"],
+                    "Outliers": rep["outliers"],
+                    "%": f'{rep["pct_outliers"]}%',
+                    "Valores": ", ".join(str(v) for v in rep.get("outlier_values", [])[:5]),
+                })
+        if out_rows:
+            st.dataframe(pd.DataFrame(out_rows), use_container_width=True, hide_index=True)
+
+    relatorio = data.get("relatorio", "")
+    if relatorio:
+        st.subheader("📄 Relatório Gerado")
+        st.code(relatorio, language="markdown")
 
 
 elif page_key == "historico":

@@ -869,6 +869,176 @@ def comando_carteiras():
         )
     print(json.dumps(saida, indent=2, ensure_ascii=False))
 
+def comando_qpe():
+    print("🧠 Quantitative Portfolio Engine v2", file=sys.stderr)
+    print("  Carregando módulos...", file=sys.stderr)
+    from qpe.outlier_detection import clean_outliers, outlier_report
+    from qpe.multi_factor_score import MultiFactorScore
+    from qpe.portfolio_optimizer import PortfolioOptimizer
+    from qpe.robustness_index import RobustnessIndex
+    from qpe.stress_test import StressTest
+    from qpe.explainability import Explainability
+    from qpe.report import PortfolioReport
+
+    print("  Analisando ações...", file=sys.stderr)
+    tickers = buscar_tickers()[:50]
+    resultados = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futuros = {ex.submit(analisar_ticker, t): t for t in tickers}
+        for fut in as_completed(futuros):
+            res = fut.result()
+            if res:
+                resultados.append(res)
+
+    if not resultados:
+        print("❌ Nenhum dado obtido.", file=sys.stderr)
+        return
+
+    df = pd.DataFrame(resultados)
+
+    print("  Tratando outliers...", file=sys.stderr)
+    metrics = ["ev_ebit", "margem_liquida"]
+    fund_df = df["fundamentos"].apply(pd.Series) if "fundamentos" in df.columns else pd.DataFrame()
+    if not fund_df.empty:
+        roe_clean = clean_outliers(fund_df, ["roe", "margem_liquida", "ev_ebit", "dy", "divida_pl"], method="iqr", k=1.5)
+        outlier_rep = outlier_report(fund_df, ["roe", "dy", "ev_ebit", "margem_liquida"])
+    else:
+        roe_clean = fund_df
+        outlier_rep = {}
+
+    print("  Calculando crescimento (CAGR)...", file=sys.stderr)
+    from qpe.growth_factor import GrowthFactor
+    gf = GrowthFactor(years=5)
+    growth_data = {}
+    for t in tickers[:30]:
+        growth_data[t] = gf.compute(t)
+
+    print("  Computando score multifatorial...", file=sys.stderr)
+    mfs = MultiFactorScore()
+    scored_assets = []
+    for item in resultados:
+        t = item["ticker"]
+        f = item.get("fundamentos", {})
+        g = growth_data.get(t, {})
+        row = {
+            "ticker": t,
+            "empresa": item.get("empresa", "").strip(),
+            "preco": item.get("preco"),
+            "setor": item.get("setor", ""),
+            "roe": f.get("roe"),
+            "roic": f.get("roe"),
+            "margem_liquida": f.get("margem_liquida"),
+            "pl": f.get("pl"),
+            "pvp": f.get("pvp"),
+            "ev_ebit": f.get("ev_ebit"),
+            "dy": f.get("dy"),
+            "dividend_consistency": 0.5,
+            "cagr_revenue": g.get("cagr_revenue"),
+            "cagr_net_income": g.get("cagr_net_income"),
+            "divida_pl": f.get("divida_pl"),
+            "liquidez_corrente": f.get("liquidez_corrente"),
+        }
+        scores = mfs.compute(row)
+        row.update(scores)
+        scored_assets.append(row)
+
+    score_df = pd.DataFrame(scored_assets)
+    if "total_score" in score_df.columns:
+        score_df["score_percentil"] = mfs.apply_percentile_ranking(score_df["total_score"])
+        score_df["classificacao"] = score_df["score_percentil"].apply(mfs.classify)
+
+    print("  Otimizando pesos da carteira...", file=sys.stderr)
+    opt = PortfolioOptimizer(peso_min=0.02, peso_max=0.10)
+    scores_list = scored_assets[0]["total_score"] if scored_assets else 0
+    if not isinstance(scores_list, list):
+        scores_list = [a["total_score"] for a in scored_assets]
+    tickers_list = [a["ticker"] for a in scored_assets]
+    weights_df = opt.optimize(scores_list, tickers_list)
+    weights_dict = dict(zip(weights_df["ticker"], weights_df["weight_pct"]))
+
+    categories = {}
+    for a in scored_assets:
+        s = a.get("setor", "Ações")
+        if s in (None, ""):
+            s = "Ações"
+        categories[a["ticker"]] = s
+
+    print("  Calculando IRP...", file=sys.stderr)
+    ri = RobustnessIndex()
+    quality_scores = [a.get("quality", 50) for a in scored_assets]
+    dy_vals = [a.get("dy") for a in scored_assets]
+    debt_vals = [a.get("divida_pl") for a in scored_assets]
+    sector_agg = {}
+    for t, w in weights_dict.items():
+        s = categories.get(t, "Outros")
+        sector_agg[s] = sector_agg.get(s, 0) + w
+    irp_result = ri.compute(
+        num_assets=len(weights_dict),
+        quality_scores=quality_scores,
+        dy_values=dy_vals,
+        debt_values=debt_vals,
+        sector_weights=sector_agg,
+    )
+
+    print("  Executando stress test...", file=sys.stderr)
+    st = StressTest()
+    stress_results = st.run_all(weights_dict, categories)
+
+    print("  Gerando explicações...", file=sys.stderr)
+    exp = Explainability()
+    explanations = exp.batch_explain(scored_assets)
+
+    print("  Gerando relatório...", file=sys.stderr)
+    report_gen = PortfolioReport(output_dir=".")
+    report_content = report_gen.generate(
+        portfolio={
+            "weights": weights_dict,
+            "assets": scored_assets,
+            "score_medio": round(float(np.mean([a["total_score"] for a in scored_assets])), 1),
+            "dy_ponderado": round(
+                sum(a.get("dy", 0) or 0 * weights_dict.get(a["ticker"], 0)
+                    for a in scored_assets) / 100.0, 2
+            ) if weights_dict else 0,
+        },
+        irp_result=irp_result,
+        stress_results=stress_results,
+        explanations=explanations,
+        profile_name="QPE v2",
+    )
+    report_path = report_gen.save(report_content)
+
+    top10 = sorted(scored_assets, key=lambda x: x["total_score"], reverse=True)[:10]
+
+    saida = {
+        "tipo": "qpe_v2",
+        "data": time.strftime("%Y-%m-%d %H:%M"),
+        "total_analisados": len(scored_assets),
+        "outliers": outlier_rep,
+        "score_medio": round(float(np.mean([a["total_score"] for a in scored_assets])), 1),
+        "carteira": {
+            "alocacao": weights_dict,
+            "total_ativos": len(weights_dict),
+        },
+        "irp": irp_result,
+        "stress_test": stress_results,
+        "top_10": [{
+            "ticker": a["ticker"],
+            "score": a["total_score"],
+            "classificacao": a.get("classificacao", ""),
+            "fatores": {
+                "qualidade": a.get("quality", 0),
+                "valuation": a.get("valuation", 0),
+                "dividendos": a.get("dividends", 0),
+                "crescimento": a.get("growth", 0),
+                "seguranca": a.get("safety", 0),
+            },
+        } for a in top10],
+        "explicacoes": explanations,
+        "relatorio": report_path,
+    }
+    salvar_snapshot("qpe_v2", saida)
+    print(json.dumps(saida, indent=2, ensure_ascii=False))
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] == "radar":
@@ -889,8 +1059,10 @@ def main():
         comando_bdrs()
     elif args[0] == "carteiras":
         comando_carteiras()
+    elif args[0] == "qpe":
+        comando_qpe()
     else:
-        print("Comandos: radar, analisar <ticker>, dividendos, magic-formula, fiis, analisar-fii <ticker>, etfs, bdrs, carteiras")
+        print("Comandos: radar, analisar <ticker>, dividendos, magic-formula, fiis, analisar-fii <ticker>, etfs, bdrs, carteiras, qpe")
 
 if __name__ == "__main__":
     main()
