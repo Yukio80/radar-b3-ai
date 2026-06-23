@@ -1042,6 +1042,205 @@ def comando_qpe():
     salvar_snapshot("qpe_v2", saida)
     print(json.dumps(saida, indent=2, ensure_ascii=False))
 
+def comando_qpe_validacao():
+    """Run QPE v3 validation: backtest, walk-forward, Monte Carlo, regime, correlation."""
+    print("🔬 Quantitative Portfolio Engine v3 — Validação", file=sys.stderr)
+    print("  1. Obtendo scores QPE v2...", file=sys.stderr)
+    from datetime import datetime, timedelta
+    import json
+
+    tickers = buscar_tickers()[:50]
+    resultados = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futuros = {ex.submit(analisar_ticker, t): t for t in tickers}
+        for fut in as_completed(futuros):
+            res = fut.result()
+            if res:
+                resultados.append(res)
+
+    from qpe.multi_factor_score import MultiFactorScore
+    from qpe.growth_factor import GrowthFactor
+    mfs = MultiFactorScore()
+    gf = GrowthFactor(years=5)
+    growth_data = {}
+    for t in tickers[:30]:
+        growth_data[t] = gf.compute(t)
+
+    scored_assets = []
+    for item in resultados:
+        t = item["ticker"]
+        f = item.get("fundamentos", {})
+        g = growth_data.get(t, {})
+        row = {
+            "ticker": t, "empresa": item.get("empresa", "").strip(),
+            "preco": item.get("preco"), "setor": item.get("setor", ""),
+            "roe": f.get("roe"), "roic": f.get("roe"),
+            "margem_liquida": f.get("margem_liquida"),
+            "pl": f.get("pl"), "pvp": f.get("pvp"),
+            "ev_ebit": f.get("ev_ebit"), "dy": f.get("dy"),
+            "dividend_consistency": 0.5,
+            "cagr_revenue": g.get("cagr_revenue"),
+            "cagr_net_income": g.get("cagr_net_income"),
+            "divida_pl": f.get("divida_pl"),
+            "liquidez_corrente": f.get("liquidez_corrente"),
+        }
+        scores = mfs.compute(row)
+        row.update(scores)
+        scored_assets.append(row)
+
+    ticker_scores = {}
+    for a in scored_assets:
+        t = a["ticker"]
+        if a.get("total_score"):
+            ticker_scores[t] = a["total_score"]
+            ticker_scores[t + ".SA"] = a["total_score"]
+    sectors = {a["ticker"]: a.get("setor", "Outros") for a in scored_assets}
+
+    start_date = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
+    end_date = datetime.now().strftime("%Y-%m-%d")
+
+    print("  2. Executando Performance Metrics...", file=sys.stderr)
+    from qpe.performance_metrics import PerformanceMetrics
+    pm = PerformanceMetrics(risk_free_rate=0.1325)
+    pf_metrics = {}
+
+    print("  3. Obtendo dados de benchmark...", file=sys.stderr)
+    from qpe.benchmark import BenchmarkEngine
+    be = BenchmarkEngine(cdi_rate=0.1325, start_date=start_date)
+    bench_data = be.download_all()
+    ibov_ret = bench_data.get("IBOV", pd.Series(dtype=float)) if "IBOV" in be._data else be.download("IBOV")
+    idiv_ret = bench_data.get("IDIV", pd.Series(dtype=float)) if "IDIV" in be._data else be.download("IDIV")
+    cdi_ret = bench_data.get("CDI", pd.Series(dtype=float)) if "CDI" in be._data else be.download("CDI")
+
+    print("  4. Executando Backtest...", file=sys.stderr)
+    from qpe.backtesting import BacktestEngine
+    bt = BacktestEngine(
+        tickers=[t + ".SA" if not t.endswith(".SA") else t for t in ticker_scores.keys()],
+        start_date=start_date,
+        end_date=end_date,
+        initial_capital=100000,
+        rebalance_frequency="trimestral",
+        top_n=10,
+    )
+    if bt._prices is None:
+        bt.download_data()
+    bt_result = bt.run(scores=ticker_scores)
+
+    print("  5. Calculando métricas vs benchmarks...", file=sys.stderr)
+    bt_returns = bt_result.get("returns", pd.Series(dtype=float))
+    metrics_qpe = pm.all_metrics(bt_returns, ibov_ret) if not bt_returns.empty else {}
+    metrics_ibov = pm.all_metrics(ibov_ret) if not ibov_ret.empty else {}
+    metrics_idiv = pm.all_metrics(idiv_ret) if not idiv_ret.empty else {}
+    metrics_cdi = pm.all_metrics(cdi_ret) if not cdi_ret.empty else {}
+
+    print("  6. Executando Walk-Forward Validation...", file=sys.stderr)
+    from qpe.walk_forward import WalkForwardValidator
+    wf = WalkForwardValidator(
+        tickers=[t + ".SA" if not t.endswith(".SA") else t for t in ticker_scores.keys()],
+        start_date=start_date,
+        end_date=end_date,
+        train_years=1,
+        test_months=6,
+        top_n=10,
+    )
+    wf_result = wf.validate()
+
+    print("  7. Executando Monte Carlo...", file=sys.stderr)
+    from qpe.monte_carlo import MonteCarloEngine
+    mc = MonteCarloEngine(num_simulations=5000, horizon_days=252, seed=42)
+    ann_ret = metrics_qpe.get("retorno_anualizado", 0.10)
+    ann_vol = metrics_qpe.get("volatilidade_anualizada", 0.20)
+    cdi_ann = metrics_cdi.get("retorno_anualizado", 0.1325)
+    ibov_ann = metrics_ibov.get("retorno_anualizado", 0.10)
+    mc_result = mc.full_analysis(
+        annual_return=ann_ret if ann_ret != 0 else 0.10,
+        annual_volatility=ann_vol if ann_vol != 0 else 0.20,
+        cdi_return=cdi_ann,
+        ibov_return=ibov_ann,
+    )
+
+    print("  8. Detecting market regime...", file=sys.stderr)
+    from qpe.regime_detector import RegimeDetector
+    rd = RegimeDetector()
+    regime_result = rd.detect(ibov_ret, cdi_rate=0.1325)
+
+    print("  9. Analisando correlações...", file=sys.stderr)
+    from qpe.correlation_analysis import CorrelationAnalyzer
+    ca = CorrelationAnalyzer()
+    fator_df = pd.DataFrame([{
+        "quality": a.get("quality", 50), "valuation": a.get("valuation", 50),
+        "dividends": a.get("dividends", 50), "growth": a.get("growth", 50),
+        "safety": a.get("safety", 50),
+    } for a in scored_assets])
+    factor_corr = ca.factor_correlation(fator_df)
+
+    corr_matrix = factor_corr.get("correlacao", pd.DataFrame())
+    avg_corr = float(corr_matrix.values[np.triu_indices_from(corr_matrix.values, k=1)].mean()) if not corr_matrix.empty and len(corr_matrix) > 1 else 0
+
+    print("  10. Gerando relatório...", file=sys.stderr)
+    from qpe.reports import save_report, BacktestReport, ValidationReport, PerformanceReport
+    os.makedirs("reports", exist_ok=True)
+
+    bench_metrics = {
+        "qpe": metrics_qpe,
+        "IBOV": metrics_ibov,
+        "IDIV": metrics_idiv,
+        "CDI": metrics_cdi,
+    }
+    bt_report = BacktestReport()
+    bt_content = bt_report.generate(bt_result, bench_metrics)
+    save_report(bt_content, "backtest_report.md")
+
+    perf_report = PerformanceReport()
+    perf_content = perf_report.generate(
+        metrics_qpe,
+        regime_analysis=regime_result,
+        correlation_analysis={
+            "correlacao_media": avg_corr,
+            "diversificacao_efetiva": ca.effective_diversification() if ca.returns is not None else 0,
+            "fator_correlacao": factor_corr,
+        },
+    )
+    save_report(perf_content, "performance_report.md")
+
+    val_report = ValidationReport()
+    val_content = val_report.generate(wf_result, mc_result)
+    save_report(val_content, "validation_report.md")
+
+    saida = {
+        "tipo": "qpe_v3_validacao",
+        "data": time.strftime("%Y-%m-%d %H:%M"),
+        "total_ativos": len(scored_assets),
+        "backtest": {
+            "retorno_total": bt_result.get("retorno_total", 0),
+            "capital_final": bt_result.get("capital_final", 0),
+            "qtd_rebalances": bt_result.get("qtd_rebalances", 0),
+        },
+        "performance": metrics_qpe,
+        "benchmark": {
+            "ibov": metrics_ibov,
+            "idiv": metrics_idiv,
+            "cdi": metrics_cdi,
+        },
+        "walk_forward": wf_result.get("resultados_consolidados", {}),
+        "monte_carlo": {
+            "var_95": mc_result.get("var_95", 0),
+            "var_99": mc_result.get("var_99", 0),
+            "probabilidade_perda": mc_result.get("probabilidade_perda", 0),
+            "probabilidade_superar_cdi": mc_result.get("probabilidade_superar_cdi", 0),
+            "probabilidade_superar_ibov": mc_result.get("probabilidade_superar_ibov", 0),
+        },
+        "regime": regime_result.get("classificacao", ""),
+        "fatores_vif": factor_corr.get("vif", {}),
+        "correlacao_media_fatores": avg_corr,
+        "relatorios": ["reports/backtest_report.md", "reports/performance_report.md", "reports/validation_report.md"],
+    }
+
+    salvar_snapshot("qpe_v3_validacao", saida)
+    print(json.dumps(saida, indent=2, ensure_ascii=False))
+    print("\n✅ Relatórios salvos em reports/", file=sys.stderr)
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] == "radar":
@@ -1064,8 +1263,10 @@ def main():
         comando_carteiras()
     elif args[0] == "qpe":
         comando_qpe()
+    elif args[0] == "qpe-validacao":
+        comando_qpe_validacao()
     else:
-        print("Comandos: radar, analisar <ticker>, dividendos, magic-formula, fiis, analisar-fii <ticker>, etfs, bdrs, carteiras, qpe")
+        print("Comandos: radar, analisar <ticker>, dividendos, magic-formula, fiis, analisar-fii <ticker>, etfs, bdrs, carteiras, qpe, qpe-validacao")
 
 if __name__ == "__main__":
     main()

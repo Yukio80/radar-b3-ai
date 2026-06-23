@@ -27,7 +27,7 @@ comando_fiis = _analise.comando_fiis
 comando_etfs = _analise.comando_etfs
 comando_bdrs = _analise.comando_bdrs
 comando_carteiras = _analise.comando_carteiras
-comando_qpe = _analise.comando_qpe
+comando_qpe_validacao = getattr(_analise, "comando_qpe_validacao", None)
 
 from database import listar_snapshots, carregar_snapshot, historico_portfolio, init_db
 init_db()
@@ -173,6 +173,19 @@ def run_qpe():
         return None
 
 
+def run_qpe_validacao():
+    buf = io.StringIO()
+    err = io.StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        comando_qpe_validacao()
+    out = buf.getvalue()
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        st.error(f"Erro na validação:\n{err.getvalue()}")
+        return None
+
+
 PAGES = {
     "📡 Radar": "radar",
     "🔍 Analisar Ticker": "analisar",
@@ -183,6 +196,7 @@ PAGES = {
     "🧙 Magic Formula": "magic",
     "💼 Carteiras": "carteiras",
     "🧠 QPE v2": "qpe",
+    "🔬 QPE v3": "qpe3",
     "📈 Histórico": "historico",
 }
 
@@ -859,6 +873,100 @@ elif page_key == "qpe":
     if relatorio:
         st.subheader("📄 Relatório Gerado")
         st.code(relatorio, language="markdown")
+
+
+elif page_key == "qpe3":
+    st.title("🔬 Quantitative Portfolio Engine v3")
+    st.markdown("Validação científica — Backtesting, Walk-Forward, Monte Carlo, Regime Detection, Correlação")
+
+    if comando_qpe_validacao is None:
+        st.error("Módulo de validação não disponível. Execute 'qpe-validacao' via CLI primeiro.")
+        st.stop()
+
+    if st.button("🔬 Executar Validação Completa", type="primary", use_container_width=True):
+        with st.spinner("Pipeline de validação (backtest → walk-forward → Monte Carlo → regime → correlação)..."):
+            data = run_qpe_validacao()
+        if data:
+            st.session_state["qpe3_data"] = data
+
+    if "qpe3_data" not in st.session_state:
+        if st.button("📂 Carregar resultado anterior"):
+            try:
+                import sqlite3
+                conn = sqlite3.connect("database.db")
+                cur = conn.execute("SELECT dados_json FROM snapshots WHERE tipo='qpe_v3_validacao' ORDER BY id DESC LIMIT 1")
+                row = cur.fetchone()
+                conn.close()
+                if row:
+                    st.session_state["qpe3_data"] = json.loads(row[0])
+            except Exception:
+                pass
+        if "qpe3_data" not in st.session_state:
+            st.warning("Clique em 'Executar Validação Completa' para iniciar.")
+            st.stop()
+
+    data = st.session_state.get("qpe3_data")
+    if not data:
+        st.warning("Nenhum dado de validação disponível.")
+        st.stop()
+
+    col1, col2, col3, col4 = st.columns(4)
+    bt = data.get("backtest", {})
+    col1.metric("Retorno Backtest", f'{bt.get("retorno_total", 0)}%')
+    pf = data.get("performance", {})
+    col2.metric("Sharpe", f'{pf.get("sharpe_ratio", 0):.2f}')
+    col3.metric("Drawdown", f'{pf.get("max_drawdown", 0)*100:.1f}%')
+    wf = data.get("walk_forward", {})
+    col4.metric("Walk-Forward Acerto", f'{wf.get("taxa_acerto", 0)}%')
+
+    st.subheader("📊 Performance vs Benchmarks")
+    bench = data.get("benchmark", {})
+    bench_rows = []
+    for name, m in [("QPE", pf), ("IBOV", bench.get("ibov", {})),
+                    ("IDIV", bench.get("idiv", {})), ("CDI", bench.get("cdi", {}))]:
+        bench_rows.append({
+            "Benchmark": name,
+            "Retorno Anualizado": f'{m.get("retorno_anualizado", 0)*100:.2f}%',
+            "Sharpe": f'{m.get("sharpe_ratio", 0):.2f}',
+            "Volatilidade": f'{m.get("volatilidade_anualizada", 0)*100:.2f}%',
+            "Drawdown": f'{m.get("max_drawdown", 0)*100:.1f}%',
+        })
+    st.dataframe(pd.DataFrame(bench_rows), use_container_width=True, hide_index=True)
+
+    st.subheader("🎲 Monte Carlo (5.000 simulações)")
+    mc = data.get("monte_carlo", {})
+    mc_col1, mc_col2, mc_col3 = st.columns(3)
+    mc_col1.metric("VaR 95%", f'{mc.get("var_95", 0)*100:.1f}%')
+    mc_col2.metric("VaR 99%", f'{mc.get("var_99", 0)*100:.1f}%')
+    mc_col3.metric("Prob. Perda", f'{mc.get("probabilidade_perda", 0)*100:.1f}%')
+
+    col_mc1, col_mc2 = st.columns(2)
+    col_mc1.metric("Prob. > CDI", f'{mc.get("probabilidade_superar_cdi", 0)*100:.1f}%')
+    col_mc2.metric("Prob. > IBOV", f'{mc.get("probabilidade_superar_ibov", 0)*100:.1f}%')
+
+    st.subheader("🌦️ Regime de Mercado")
+    st.info(f'**Regime atual:** {data.get("regime", "Desconhecido")}')
+
+    st.subheader("🔗 Análise de Fatores")
+    vif = data.get("fatores_vif", {})
+    if vif:
+        vif_df = pd.DataFrame([{"Fator": k.capitalize(), "VIF": v} for k, v in vif.items()])
+        st.dataframe(vif_df, use_container_width=True, hide_index=True)
+        collinear = {k: v for k, v in vif.items() if v > 5}
+        if collinear:
+            st.warning(f"Alta colinearidade detectada em: {', '.join(collinear.keys())}")
+
+    relatorios = data.get("relatorios", [])
+    if relatorios:
+        st.subheader("📄 Relatórios Gerados")
+        for r_path in relatorios:
+            try:
+                with open(r_path) as f:
+                    content = f.read()
+                with st.expander(f"📄 {r_path.split('/')[-1]}"):
+                    st.markdown(content)
+            except Exception:
+                pass
 
 
 elif page_key == "historico":
