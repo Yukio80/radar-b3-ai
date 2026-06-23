@@ -946,6 +946,9 @@ def comando_qpe():
     if "total_score" in score_df.columns:
         score_df["score_percentil"] = mfs.apply_percentile_ranking(score_df["total_score"])
         score_df["classificacao"] = score_df["score_percentil"].apply(mfs.classify)
+        for i, a in enumerate(scored_assets):
+            scored_assets[i]["score_percentil"] = float(score_df.iloc[i]["score_percentil"])
+            scored_assets[i]["classificacao"] = score_df.iloc[i]["classificacao"]
 
     print("  Otimizando pesos da carteira...", file=sys.stderr)
     opt = PortfolioOptimizer(peso_min=0.02, peso_max=0.10)
