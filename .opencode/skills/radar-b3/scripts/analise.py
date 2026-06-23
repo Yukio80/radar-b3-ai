@@ -1461,6 +1461,149 @@ def comando_qpe_v4():
     print("\n✅ QPE v4 completo. Relatorios em reports/", file=sys.stderr)
 
 
+def comando_qpe_carteiras():
+    """Run QPE v5 full pipeline: portfolio profiles, conviction scoring,
+    market score, recommendation engine, and reports."""
+    print("📊 QPE v5 — Carteiras Recomendadas", file=sys.stderr)
+    import json, time, os, numpy as np, pandas as pd
+    from datetime import datetime, timedelta
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    print("  1. Coletando dados fundamentalistas...", file=sys.stderr)
+    tickers = buscar_tickers()[:50]
+    resultados = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futuros = {ex.submit(analisar_ticker, t): t for t in tickers}
+        for fut in as_completed(futuros):
+            res = fut.result()
+            if res:
+                resultados.append(res)
+
+    from qpe.multi_factor_score import MultiFactorScore
+    from qpe.growth_factor import GrowthFactor
+    from qpe.alpha_engine import AlphaEngine
+    from qpe.regime_detector import RegimeDetector
+    from qpe.benchmark import BenchmarkEngine
+    from qpe.recommendation_engine import RecommendationEngine
+    from qpe.recommendation_reports import _carteira_report, generate_market_report, generate_validation_report, save_report as save_rec_report
+    from qpe.portfolio_profiles import PROFILES
+
+    mfs = MultiFactorScore()
+    gf = GrowthFactor(years=5)
+    growth_data = {}
+    for t in tickers[:30]:
+        growth_data[t] = gf.compute(t)
+
+    scored_assets, sectors = [], {}
+    for item in resultados:
+        t = item["ticker"]
+        f = item.get("fundamentos", {})
+        g = growth_data.get(t, {})
+        row = {"ticker": t, "setor": item.get("setor", ""),
+               "empresa": item.get("empresa", "").strip(),
+               "roe": f.get("roe"), "roic": f.get("roe"),
+               "margem_liquida": f.get("margem_liquida"),
+               "pl": f.get("pl"), "pvp": f.get("pvp"),
+               "ev_ebit": f.get("ev_ebit"), "dy": f.get("dy"),
+               "dividend_consistency": 0.5,
+               "cagr_revenue": g.get("cagr_revenue"),
+               "cagr_net_income": g.get("cagr_net_income"),
+               "divida_pl": f.get("divida_pl"),
+               "liquidez_corrente": f.get("liquidez_corrente")}
+        scores = mfs.compute(row)
+        row.update(scores)
+        scored_assets.append(row)
+        sectors[t] = item.get("setor", "Outros")
+
+    start_s = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
+    end_s = datetime.now().strftime("%Y-%m-%d")
+
+    print("  2. Detectando regime de mercado...", file=sys.stderr)
+    be = BenchmarkEngine(cdi_rate=0.1325, start_date=start_s)
+    ibov_ret = be.download("IBOV")
+    rd = RegimeDetector()
+    regime_result = rd.detect(ibov_ret, cdi_rate=0.1325)
+    current_regime = regime_result.get("regime", "unknown")
+
+    print("  3. Computando alpha scores...", file=sys.stderr)
+    ae = AlphaEngine()
+    for a in scored_assets:
+        alpha = ae.compute_alpha({
+            "quality": a.get("quality", 50),
+            "valuation": a.get("valuation", 50),
+            "dividends": a.get("dividends", 50),
+            "growth": a.get("growth", 50),
+            "safety": a.get("safety", 50),
+        })
+        a["alpha_score"] = alpha
+
+    print("  4. Baixando dados históricos...", file=sys.stderr)
+    price_tickers = [t + ".SA" if not t.endswith(".SA") else t for t in [a["ticker"] for a in scored_assets]]
+    try:
+        import yfinance as yf
+        px = yf.download(price_tickers, start=start_s, end=end_s, progress=False, auto_adjust=True)
+        if isinstance(px.columns, pd.MultiIndex):
+            px = px["Close"] if "Close" in px.columns else px
+        if isinstance(px, pd.Series):
+            px = px.to_frame()
+        returns = px.pct_change().dropna(how="all")
+        returns.columns = [c.replace(".SA", "") for c in returns.columns]
+    except Exception:
+        returns = pd.DataFrame()
+
+    print("  5. Gerando recomendações para todos os perfis...", file=sys.stderr)
+    engine = RecommendationEngine()
+    all_recs = engine.recommend_all(
+        scored_assets=scored_assets,
+        regime=current_regime,
+        returns=returns,
+        benchmark_returns=ibov_ret,
+    )
+
+    print("  6. Salvando relatórios...", file=sys.stderr)
+    os.makedirs("reports", exist_ok=True)
+    consolidated = {}
+    for name, rec in all_recs.items():
+        profile_name = rec.profile.lower().replace(" ", "_")
+        content = _carteira_report(rec, profile_name, current_regime)
+        save_rec_report(content, f"carteira_{profile_name}.md")
+        consolidated[name] = {
+            "profile": rec.profile,
+            "score_medio": rec.score_medio,
+            "conviction_media": rec.conviction_media,
+            "sharpe": rec.metrics.get("sharpe_ratio", 0),
+            "irp": rec.irp_result.get("IRP", 0),
+            "alpha": rec.metrics.get("alpha", 0),
+            "drawdown": rec.metrics.get("max_drawdown", 0),
+            "num_ativos": len(rec.positions),
+            "regime": current_regime,
+        }
+
+    market_score = engine._compute_market_score(scored_assets, current_regime)
+    market_content = generate_market_report(
+        market_score, current_regime,
+        RegimeDetector.regime_description(current_regime),
+        consolidated,
+    )
+    save_rec_report(market_content, "market_report.md")
+    val_content = generate_validation_report(consolidated)
+    save_rec_report(val_content, "qpe_v5_validation.md")
+
+    saida = {
+        "tipo": "qpe_v5_carteiras",
+        "data": time.strftime("%Y-%m-%d %H:%M"),
+        "regime": current_regime,
+        "market_score": market_score,
+        "consolidado": consolidated,
+        "relatorios": [
+            f"reports/carteira_{p.lower().replace(' ', '_')}.md" for p in PROFILES
+        ] + ["reports/market_report.md", "reports/qpe_v5_validation.md"],
+    }
+    salvar_snapshot("qpe_v5_carteiras", saida)
+    print(json.dumps(saida, indent=2, ensure_ascii=False))
+    print("\n✅ QPE v5 completo. Relatorios em reports/", file=sys.stderr)
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] == "radar":
@@ -1487,8 +1630,10 @@ def main():
         comando_qpe_validacao()
     elif args[0] == "qpe-v4":
         comando_qpe_v4()
+    elif args[0] == "qpe-carteiras":
+        comando_qpe_carteiras()
     else:
-        print("Comandos: radar, analisar <ticker>, dividendos, magic-formula, fiis, analisar-fii <ticker>, etfs, bdrs, carteiras, qpe, qpe-validacao, qpe-v4")
+        print("Comandos: radar, analisar <ticker>, dividendos, magic-formula, fiis, analisar-fii <ticker>, etfs, bdrs, carteiras, qpe, qpe-validacao, qpe-v4, qpe-carteiras")
 
 if __name__ == "__main__":
     main()

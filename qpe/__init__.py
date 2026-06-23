@@ -24,6 +24,12 @@ from qpe.enhanced_stress import AdvancedStressTest
 from qpe.reports_v4 import (generate_alpha_report, generate_optimization_report,
                             generate_regime_report, generate_attribution_report,
                             generate_v4_validation, save_report as save_v4_report)
+from qpe.portfolio_profiles import PortfolioProfile, get_profile, list_profiles, PROFILES
+from qpe.conviction_score import ConvictionEngine
+from qpe.market_score import QPEMarketScore
+from qpe.recommendation_engine import RecommendationEngine, RecommendedPortfolio
+from qpe.recommendation_reports import (_carteira_report, generate_market_report,
+                                        generate_validation_report, save_report as save_rec_report)
 
 __all__ = [
     "detect_outliers_iqr",
@@ -65,4 +71,16 @@ __all__ = [
     "generate_attribution_report",
     "generate_v4_validation",
     "save_v4_report",
+    "PortfolioProfile",
+    "get_profile",
+    "list_profiles",
+    "PROFILES",
+    "ConvictionEngine",
+    "QPEMarketScore",
+    "RecommendationEngine",
+    "RecommendedPortfolio",
+    "_carteira_report",
+    "generate_market_report",
+    "generate_validation_report",
+    "save_rec_report",
 ]
