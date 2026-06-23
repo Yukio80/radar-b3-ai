@@ -1241,6 +1241,226 @@ def comando_qpe_validacao():
     print("\n✅ Relatórios salvos em reports/", file=sys.stderr)
 
 
+def comando_qpe_v4():
+    """Run QPE v4 full pipeline: regime-aware alpha, covariance shrinkage,
+    two-stage selection, MV optimization, Black-Litterman, advanced stress."""
+    print("🚀 Quantitative Portfolio Engine v4 — Alpha Generation", file=sys.stderr)
+    import json, time, os, numpy as np, pandas as pd
+    from datetime import datetime, timedelta
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    print("  1. Coletando dados fundamentalistas...", file=sys.stderr)
+    tickers = buscar_tickers()[:50]
+    resultados = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futuros = {ex.submit(analisar_ticker, t): t for t in tickers}
+        for fut in as_completed(futuros):
+            res = fut.result()
+            if res:
+                resultados.append(res)
+
+    from qpe.multi_factor_score import MultiFactorScore
+    from qpe.growth_factor import GrowthFactor
+    from qpe.alpha_engine import AlphaEngine
+    from qpe.performance_metrics import PerformanceMetrics
+    from qpe.benchmark import BenchmarkEngine
+    from qpe.backtesting import BacktestEngine
+    from qpe.walk_forward import WalkForwardValidator
+    from qpe.monte_carlo import MonteCarloEngine
+    from qpe.covariance_models import auto_select_covariance
+    from qpe.portfolio_construction import TwoStagePortfolioBuilder, MeanVarianceOptimizer
+    from qpe.black_litterman import BlackLittermanOptimizer
+    from qpe.enhanced_stress import AdvancedStressTest
+    from qpe.regime_detector import RegimeDetector
+    from qpe.attribution import AlphaAttributionEngine
+    from qpe.reports_v4 import (generate_alpha_report, generate_optimization_report,
+                                generate_regime_report, generate_attribution_report,
+                                generate_v4_validation, save_report as save_v4_report)
+    from qpe.correlation_analysis import CorrelationAnalyzer
+
+    mfs = MultiFactorScore()
+    gf = GrowthFactor(years=5)
+    growth_data = {}
+    for t in tickers[:30]:
+        growth_data[t] = gf.compute(t)
+
+    scored_assets, sectors = [], {}
+    for item in resultados:
+        t = item["ticker"]
+        f = item.get("fundamentos", {})
+        g = growth_data.get(t, {})
+        row = {"ticker": t, "setor": item.get("setor", ""),
+               "roe": f.get("roe"), "roic": f.get("roe"),
+               "margem_liquida": f.get("margem_liquida"),
+               "pl": f.get("pl"), "pvp": f.get("pvp"),
+               "ev_ebit": f.get("ev_ebit"), "dy": f.get("dy"),
+               "dividend_consistency": 0.5,
+               "cagr_revenue": g.get("cagr_revenue"),
+               "cagr_net_income": g.get("cagr_net_income"),
+               "divida_pl": f.get("divida_pl"),
+               "liquidez_corrente": f.get("liquidez_corrente")}
+        scores = mfs.compute(row)
+        row.update(scores)
+        scored_assets.append(row)
+        sectors[t] = item.get("setor", "Outros")
+
+    ticker_scores = {a["ticker"]: a["total_score"] for a in scored_assets if a.get("total_score")}
+
+    print("  2. Detectando regime de mercado...", file=sys.stderr)
+    start_s = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
+    end_s = datetime.now().strftime("%Y-%m-%d")
+    be = BenchmarkEngine(cdi_rate=0.1325, start_date=start_s)
+    ibov_ret = be.download("IBOV")
+    rd = RegimeDetector()
+    regime_result = rd.detect(ibov_ret, cdi_rate=0.1325)
+    current_regime = regime_result.get("regime", "unknown")
+
+    print("  3. Computando alpha scores com ajuste de regime...", file=sys.stderr)
+    ae = AlphaEngine()
+    factor_assets = [{"ticker": a["ticker"],
+                      "quality": a.get("quality", 50),
+                      "valuation": a.get("valuation", 50),
+                      "dividends": a.get("dividends", 50),
+                      "growth": a.get("growth", 50),
+                      "safety": a.get("safety", 50)}
+                     for a in scored_assets]
+    alpha_assets = ae.compute_alpha_batch(factor_assets, regime=current_regime)
+    alpha_scores = {a["ticker"]: a["alpha_score"] for a in alpha_assets}
+    factor_weights = ae.get_factor_weights(current_regime)
+
+    print("  4. Baixando dados históricos de preços...", file=sys.stderr)
+    price_tickers = [t + ".SA" if not t.endswith(".SA") else t for t in ticker_scores.keys()]
+    try:
+        import yfinance as yf
+        px = yf.download(price_tickers, start=start_s, end=end_s, progress=False, auto_adjust=True)
+        if isinstance(px.columns, pd.MultiIndex):
+            px = px["Close"] if "Close" in px.columns else px
+        if isinstance(px, pd.Series):
+            px = px.to_frame()
+        returns = px.pct_change().dropna(how="all")
+        returns.columns = [c.replace(".SA", "") for c in returns.columns]
+    except Exception:
+        returns = pd.DataFrame()
+
+    print("  5. Construção two-stage da carteira...", file=sys.stderr)
+    builder = TwoStagePortfolioBuilder(optim_method="max_sharpe", max_asset_weight=0.08,
+                                       max_sector_weight=0.20, target_te=0.08)
+    portfolio_result = builder.build(
+        tickers=list(ticker_scores.keys()),
+        scores=ticker_scores,
+        returns=returns,
+        sector_map=sectors if sectors else None,
+        top_k=30,
+        regime_adjusted_scores=alpha_scores,
+    )
+
+    stage1 = portfolio_result.get("stage1", {})
+    stage2 = portfolio_result.get("stage2", {})
+    optimized_weights = stage2.get("pesos", {})
+
+    if not optimized_weights:
+        optimized_weights = {t: 1.0/len(ticker_scores) for t in list(ticker_scores.keys())[:20]}
+
+    print("  6. Black-Litterman...", file=sys.stderr)
+    bl_result = {}
+    bl_tickers = list(optimized_weights.keys())[:20]
+    if len(bl_tickers) >= 2 and not returns.empty:
+        bl_ret = returns[[c for c in bl_tickers if c in returns.columns]].dropna()
+        if bl_ret.shape[1] >= 2 and bl_ret.shape[0] >= 20:
+            cov_result = auto_select_covariance(bl_ret.values)
+            bl = BlackLittermanOptimizer(max_weight=0.08)
+            bl_result = bl.optimize(cov_result.covariance, bl_tickers,
+                                    {t: alpha_scores.get(t, 50) for t in bl_tickers})
+
+    print("  7. Performance metrics vs benchmarks...", file=sys.stderr)
+    pm = PerformanceMetrics(risk_free_rate=0.1325)
+    bt = BacktestEngine(tickers=price_tickers, start_date=start_s, end_date=end_s,
+                        initial_capital=100000, rebalance_frequency="trimestral", top_n=10)
+    if bt._prices is None:
+        bt.download_data()
+    bt_result = bt.run(scores={k + ".SA": v for k, v in alpha_scores.items()})
+    bt_returns = bt_result.get("returns", pd.Series(dtype=float))
+    metrics_qpe = pm.all_metrics(bt_returns, ibov_ret) if not bt_returns.empty else {}
+    idiv_ret = be.download("IDIV") if "IDIV" not in be._data else be._data["IDIV"]
+    cdi_ret = be.download("CDI") if "CDI" not in be._data else be._data["CDI"]
+
+    print("  8. Walk-Forward...", file=sys.stderr)
+    wf = WalkForwardValidator(tickers=price_tickers, start_date=start_s, end_date=end_s,
+                              train_years=1, test_months=6, top_n=10, rebalance_frequency="trimestral")
+    wf_result = wf.validate()
+
+    print("  9. Monte Carlo...", file=sys.stderr)
+    ann_ret = metrics_qpe.get("retorno_anualizado", 0.10) or 0.10
+    ann_vol = metrics_qpe.get("volatilidade_anualizada", 0.20) or 0.20
+    mc = MonteCarloEngine(num_simulations=5000, horizon_days=252, seed=42)
+    mc_result = mc.full_analysis(annual_return=ann_ret, annual_volatility=ann_vol,
+                                 cdi_return=0.1325, ibov_return=ibov_ret.mean()*252 if not ibov_ret.empty else 0.10)
+
+    print("  10. Stress test avançado...", file=sys.stderr)
+    astress = AdvancedStressTest()
+    stress_result = astress.run_all(optimized_weights, sectors)
+
+    print("  11. Alpha attribution...", file=sys.stderr)
+    attrib = AlphaAttributionEngine(risk_free_rate=0.1325)
+    fator_df = pd.DataFrame([{"ticker": a["ticker"],
+                              "quality": a.get("quality", 50),
+                              "valuation": a.get("valuation", 50),
+                              "dividends": a.get("dividends", 50),
+                              "growth": a.get("growth", 50),
+                              "safety": a.get("safety", 50)}
+                             for a in scored_assets]).set_index("ticker")
+    attribution_result = attrib.attribute(factor_weights, fator_df, returns, ibov_ret, optimized_weights)
+
+    print("  12. Correlation analysis...", file=sys.stderr)
+    ca = CorrelationAnalyzer()
+    corr_result = ca.factor_correlation(fator_df)
+
+    print("  13. Gerando relatórios...", file=sys.stderr)
+    os.makedirs("reports", exist_ok=True)
+    validation_data = {
+        "performance": metrics_qpe,
+        "benchmark": {"ibov": pm.all_metrics(ibov_ret) if not ibov_ret.empty else {},
+                      "idiv": pm.all_metrics(idiv_ret) if not idiv_ret.empty else {},
+                      "cdi": pm.all_metrics(cdi_ret) if not cdi_ret.empty else {}},
+        "walk_forward": wf_result.get("resultados_consolidados", {}),
+        "monte_carlo": mc_result,
+        "regime": current_regime,
+        "advanced_stress": stress_result,
+    }
+
+    save_v4_report(generate_alpha_report(validation_data), "alpha_report.md")
+    save_v4_report(generate_optimization_report(stage1, stage2), "optimization_report.md")
+    save_v4_report(generate_regime_report(regime_result, factor_weights, AlphaEngine.BASE_WEIGHTS), "regime_report.md")
+    save_v4_report(generate_attribution_report(attribution_result), "attribution_report.md")
+    save_v4_report(generate_v4_validation(validation_data), "qpe_v4_validation.md")
+
+    saida = {
+        "tipo": "qpe_v4",
+        "data": time.strftime("%Y-%m-%d %H:%M"),
+        "regime": current_regime,
+        "performance": metrics_qpe,
+        "benchmark": {"ibov_ret": ibov_ret.mean()*252 if not ibov_ret.empty else 0,
+                      "cdi_ret": 0.1325},
+        "stage1": stage1,
+        "stage2": stage2,
+        "black_litterman": {"sharpe": bl_result.get("sharpe_esperado", 0)} if bl_result else {},
+        "monte_carlo": {"var_95": mc_result.get("var_95", 0),
+                        "prob_perda": mc_result.get("probabilidade_perda", 0),
+                        "prob_cdi": mc_result.get("probabilidade_superar_cdi", 0)},
+        "stress_test_avancado": {"pior_cenario": stress_result.get("pior_cenario", ""),
+                                  "classificacao": stress_result.get("classificacao_risco", "")},
+        "attribution": {"melhor_fator": attribution_result.get("melhor_fator", ""),
+                         "fatores_significativos": attribution_result.get("fatores_significativos", 0)},
+        "relatorios": ["reports/alpha_report.md", "reports/optimization_report.md",
+                       "reports/regime_report.md", "reports/attribution_report.md",
+                       "reports/qpe_v4_validation.md"],
+    }
+
+    salvar_snapshot("qpe_v4", saida)
+    print(json.dumps(saida, indent=2, ensure_ascii=False))
+    print("\n✅ QPE v4 completo. Relatorios em reports/", file=sys.stderr)
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] == "radar":
@@ -1265,8 +1485,10 @@ def main():
         comando_qpe()
     elif args[0] == "qpe-validacao":
         comando_qpe_validacao()
+    elif args[0] == "qpe-v4":
+        comando_qpe_v4()
     else:
-        print("Comandos: radar, analisar <ticker>, dividendos, magic-formula, fiis, analisar-fii <ticker>, etfs, bdrs, carteiras, qpe, qpe-validacao")
+        print("Comandos: radar, analisar <ticker>, dividendos, magic-formula, fiis, analisar-fii <ticker>, etfs, bdrs, carteiras, qpe, qpe-validacao, qpe-v4")
 
 if __name__ == "__main__":
     main()
